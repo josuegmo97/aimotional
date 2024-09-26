@@ -5,11 +5,8 @@
 #include <flutter/flutter_view_controller.h>
 
 #include <memory>
-
+#include <string>
 #include "win32_window.h"
-
-// Declaración de la función RegisterPlugins
-// void RegisterPlugins(flutter::FlutterEngine* flutter_engine);
 
 // A window that does nothing but host a Flutter view.
 class FlutterWindow : public Win32Window {
@@ -33,4 +30,4 @@ class FlutterWindow : public Win32Window {
   std::unique_ptr<flutter::FlutterViewController> flutter_controller_;
 };
 
-#endif  // RUNNER_FLUTTER_WINDOW_H
+#endif  // RUNNER_FLUTTER_WINDOW_H_
