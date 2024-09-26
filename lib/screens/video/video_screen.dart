@@ -33,8 +33,6 @@ class VideoScreen extends StatelessWidget {
                 return;
               }
 
-              print("Procede a grabar");
-
               await cameraService.startRecording('$filePath/video.mp4', cameraName);
             },
             child: const Text("Iniciar Grabación"),

@@ -1,3 +1,4 @@
+#include <iostream>
 #include "flutter_window.h"
 #include <flutter/method_channel.h>
 #include <flutter/standard_method_codec.h>
@@ -11,12 +12,16 @@
 
 
 
-// Variables para la captura de video
+// Variables globales para la captura de video
 IMediaControl* mediaControl = nullptr;
 IGraphBuilder* graphBuilder = nullptr;
 ICaptureGraphBuilder2* captureGraphBuilder = nullptr;
 IBaseFilter* videoCaptureFilter = nullptr;
+IBaseFilter* muxFilter = nullptr; // <- Declarada correctamente
+IBaseFilter* fileWriterFilter = nullptr; // <- Declarada correctamente
+IBaseFilter* compressorFilter = nullptr; // Filtro de compresión de video
 IMediaEvent* mediaEvent = nullptr;
+IFileSinkFilter* fileSink = nullptr;
 bool isRecording = false;
 
 // Helper para convertir std::string a std::wstring
@@ -38,34 +43,203 @@ std::string WideStringToString(const std::wstring& wstr) {
   return str;
 }
 
+// Función para enumerar y seleccionar la cámara correcta por su nombre
+// Función para seleccionar la cámara por nombre
+IBaseFilter* GetCameraByName(const std::string& cameraName) {
+    ICreateDevEnum* pDevEnum = nullptr;
+    IEnumMoniker* pEnum = nullptr;
+    IBaseFilter* selectedCamera = nullptr;
+    HRESULT hr;
+
+    // Crear enumerador de dispositivos
+    hr = CoCreateInstance(CLSID_SystemDeviceEnum, nullptr, CLSCTX_INPROC_SERVER, IID_ICreateDevEnum, (void**)&pDevEnum);
+    if (FAILED(hr)) {
+        std::cerr << "Error al crear enumerador de dispositivos: " << hr << std::endl;
+        return nullptr;
+    }
+
+    // Enumerar dispositivos de video
+    hr = pDevEnum->CreateClassEnumerator(CLSID_VideoInputDeviceCategory, &pEnum, 0);
+    if (hr == S_OK) {
+        IMoniker* pMoniker = nullptr;
+        while (pEnum->Next(1, &pMoniker, nullptr) == S_OK) {
+            IPropertyBag* pPropBag;
+            hr = pMoniker->BindToStorage(0, 0, IID_IPropertyBag, (void**)&pPropBag);
+            if (SUCCEEDED(hr)) {
+                VARIANT varName;
+                VariantInit(&varName);
+
+                // Obtener el nombre de la cámara
+                hr = pPropBag->Read(L"FriendlyName", &varName, 0);
+                if (SUCCEEDED(hr)) {
+                    std::wstring ws(varName.bstrVal, SysStringLen(varName.bstrVal));
+
+                    // Convertir std::wstring a std::string
+                    std::string deviceName = WideStringToString(ws);
+
+                    std::cout << "Dispositivo encontrado: " << deviceName << std::endl;
+
+                    // Verificar si es el dispositivo que estamos buscando
+                    if (deviceName == cameraName) {
+                        // Crear el filtro para esta cámara
+                        hr = pMoniker->BindToObject(0, 0, IID_IBaseFilter, (void**)&selectedCamera);
+                        if (FAILED(hr)) {
+                            std::cerr << "Error al crear filtro para la cámara: " << hr << std::endl;
+                        } else {
+                            std::cout << "Cámara seleccionada: " << deviceName << std::endl;
+                        }
+                    }
+                }
+                VariantClear(&varName);
+                pPropBag->Release();
+            }
+            pMoniker->Release();
+
+            if (selectedCamera != nullptr) {
+                break; // Si ya encontramos la cámara, no necesitamos seguir buscando
+            }
+        }
+        pEnum->Release();
+    }
+    pDevEnum->Release();
+    return selectedCamera;
+}
+
 // Método para inicializar la captura de video
 void InitializeVideoCapture() {
-  CoInitialize(nullptr);
-  CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER, IID_IGraphBuilder, (void**)&graphBuilder);
-  CoCreateInstance(CLSID_CaptureGraphBuilder2, nullptr, CLSCTX_INPROC_SERVER, IID_ICaptureGraphBuilder2, (void**)&captureGraphBuilder);
-  captureGraphBuilder->SetFiltergraph(graphBuilder);
-  CoCreateInstance(CLSID_VideoInputDeviceCategory, nullptr, CLSCTX_INPROC_SERVER, IID_IBaseFilter, (void**)&videoCaptureFilter);
-  graphBuilder->AddFilter(videoCaptureFilter, L"Video Capture");
-  graphBuilder->QueryInterface(IID_IMediaControl, (void**)&mediaControl);
-  graphBuilder->QueryInterface(IID_IMediaEvent, (void**)&mediaEvent);
-}
+   std::cout << "Inicializando captura de video" << std::endl;
+    CoInitialize(nullptr);
+    CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER, IID_IGraphBuilder, (void**)&graphBuilder);
+    CoCreateInstance(CLSID_CaptureGraphBuilder2, nullptr, CLSCTX_INPROC_SERVER, IID_ICaptureGraphBuilder2, (void**)&captureGraphBuilder);
+    captureGraphBuilder->SetFiltergraph(graphBuilder);
+    CoCreateInstance(CLSID_VideoInputDeviceCategory, nullptr, CLSCTX_INPROC_SERVER, IID_IBaseFilter, (void**)&videoCaptureFilter);
+    graphBuilder->AddFilter(videoCaptureFilter, L"Video Capture");
 
-// Método para empezar la grabación de video
-void StartRecording(const std::string& filePath) {
-  if (!isRecording) {
-    mediaControl->Run();
-    isRecording = true;
-  }
-}
+    // Crear y agregar el filtro de compresión de video (opcional)
+    CoCreateInstance(CLSID_VideoCompressorCategory, nullptr, CLSCTX_INPROC_SERVER, IID_IBaseFilter, (void**)&compressorFilter);
+    graphBuilder->AddFilter(compressorFilter, L"Video Compressor");
 
+    // Crear y agregar el filtro de multiplexación (muxFilter)
+    CoCreateInstance(CLSID_AviDest, nullptr, CLSCTX_INPROC_SERVER, IID_IBaseFilter, (void**)&muxFilter);
+    graphBuilder->AddFilter(muxFilter, L"AVI Mux");
+
+    // Crear y agregar el filtro de escritura a archivo (fileWriterFilter)
+    CoCreateInstance(CLSID_FileWriter, nullptr, CLSCTX_INPROC_SERVER, IID_IBaseFilter, (void**)&fileWriterFilter);
+    graphBuilder->AddFilter(fileWriterFilter, L"File Writer");
+
+    // Obtenemos la interfaz IFileSinkFilter para establecer el archivo de salida
+    fileWriterFilter->QueryInterface(IID_IFileSinkFilter, (void**)&fileSink);
+
+    // Obtenemos el control del flujo
+    graphBuilder->QueryInterface(IID_IMediaControl, (void**)&mediaControl);
+    graphBuilder->QueryInterface(IID_IMediaEvent, (void**)&mediaEvent);
+}
+// Método para empezar la grabación de video, recibe el nombre de la cámara y el filePath
+void StartRecording(const std::string& filePath, const std::string& cameraName) {
+    std::cout << "Iniciando grabación en: " << filePath << " con la cámara: " << cameraName << std::endl;
+
+    if (!isRecording) {
+        // Inicializar el grafo de captura si no se ha inicializado
+        CoInitialize(nullptr);
+
+        HRESULT hr;
+
+        // Crear el grafo de filtros si no existe
+        if (!graphBuilder) {
+            hr = CoCreateInstance(CLSID_FilterGraph, nullptr, CLSCTX_INPROC_SERVER, IID_IGraphBuilder, (void**)&graphBuilder);
+            if (FAILED(hr)) {
+                std::cerr << "Error al crear FilterGraph: " << hr << std::endl;
+                return;
+            }
+        }
+
+        // Crear el capturador de gráficos si no existe
+        if (!captureGraphBuilder) {
+            hr = CoCreateInstance(CLSID_CaptureGraphBuilder2, nullptr, CLSCTX_INPROC_SERVER, IID_ICaptureGraphBuilder2, (void**)&captureGraphBuilder);
+            if (FAILED(hr)) {
+                std::cerr << "Error al crear CaptureGraphBuilder2: " << hr << std::endl;
+                return;
+            }
+            captureGraphBuilder->SetFiltergraph(graphBuilder);
+        }
+
+        // Seleccionar la cámara por su nombre
+        videoCaptureFilter = GetCameraByName(cameraName);
+        if (!videoCaptureFilter) {
+            std::cerr << "Error: No se pudo encontrar o seleccionar la cámara: " << cameraName << std::endl;
+            return;
+        }
+
+        // Agregar el filtro de captura de video al grafo
+        hr = graphBuilder->AddFilter(videoCaptureFilter, L"Video Capture");
+        if (FAILED(hr)) {
+            std::cerr << "Error al agregar filtro de captura de video al grafo: " << hr << std::endl;
+            return;
+        }
+
+        // Crear y agregar el filtro de multiplexación (muxFilter)
+        if (!muxFilter) {
+            hr = CoCreateInstance(CLSID_AviDest, nullptr, CLSCTX_INPROC_SERVER, IID_IBaseFilter, (void**)&muxFilter);
+            if (FAILED(hr)) {
+                std::cerr << "Error al crear AVI Mux: " << hr << std::endl;
+                return;
+            }
+            graphBuilder->AddFilter(muxFilter, L"AVI Mux");
+        }
+
+        // Crear y agregar el filtro de escritura a archivo (fileWriterFilter)
+        if (!fileWriterFilter) {
+            hr = CoCreateInstance(CLSID_FileWriter, nullptr, CLSCTX_INPROC_SERVER, IID_IBaseFilter, (void**)&fileWriterFilter);
+            if (FAILED(hr)) {
+                std::cerr << "Error al crear File Writer: " << hr << std::endl;
+                return;
+            }
+            graphBuilder->AddFilter(fileWriterFilter, L"File Writer");
+
+            // Obtener la interfaz IFileSinkFilter para establecer el archivo de salida
+            fileWriterFilter->QueryInterface(IID_IFileSinkFilter, (void**)&fileSink);
+        }
+
+        // Establecer el archivo de destino
+        std::wstring wideFilePath = stringToWideString(filePath);
+        hr = fileSink->SetFileName(wideFilePath.c_str(), nullptr);
+        if (FAILED(hr)) {
+            std::cerr << "Error al establecer el archivo de destino: " << hr << std::endl;
+            return;
+        }
+
+        // Conectar los filtros: video capture -> AVI Mux -> File Writer
+        hr = captureGraphBuilder->RenderStream(&PIN_CATEGORY_CAPTURE, &MEDIATYPE_Video, videoCaptureFilter, nullptr, muxFilter);
+        if (FAILED(hr)) {
+            std::cerr << "Error al conectar captura de video con AVI Mux: " << hr << std::endl;
+            return;
+        }
+
+        hr = captureGraphBuilder->RenderStream(nullptr, nullptr, muxFilter, nullptr, fileWriterFilter);
+        if (FAILED(hr)) {
+            std::cerr << "Error al conectar AVI Mux con el File Writer: " << hr << std::endl;
+            return;
+        }
+
+        // Comenzar la grabación
+        mediaControl->Run();
+        isRecording = true;
+        std::cout << "Grabación iniciada con la cámara: " << cameraName << std::endl;
+    } else {
+        std::cout << "Grabación ya estaba en curso." << std::endl;
+    }
+}
 // Método para detener la grabación de video
 void StopRecording() {
-  if (isRecording) {
-    mediaControl->Stop();
-    isRecording = false;
-  }
+    std::cout << "Deteniendo grabación" << std::endl;
+    if (isRecording) {
+        mediaControl->Stop();
+        isRecording = false;
+        std::cout << "Grabación detenida." << std::endl;
+    } else {
+        std::cout << "No había grabación en curso." << std::endl;
+    }
 }
-
 
 // Función para obtener la lista de cámaras conectadas
 std::vector<std::string> GetAvailableCameras() {
@@ -166,7 +340,8 @@ bool FlutterWindow::OnCreate() {
         } else if (call.method_name().compare("startRecording") == 0) {
           const auto* arguments = std::get_if<flutter::EncodableMap>(call.arguments());
           std::string filePath = std::get<std::string>(arguments->at(flutter::EncodableValue("path")));
-          StartRecording(filePath);
+          std::string cameraName = std::get<std::string>(arguments->at(flutter::EncodableValue("camera")));
+          StartRecording(filePath, cameraName);
           result->Success();
         } else if (call.method_name().compare("stopRecording") == 0) {
           StopRecording();
